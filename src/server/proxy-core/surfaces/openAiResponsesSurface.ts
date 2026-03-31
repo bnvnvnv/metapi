@@ -4,6 +4,13 @@ import { reportProxyAllFailed } from '../../services/alertService.js';
 import { mergeProxyUsage, parseProxyUsage } from '../../services/proxyUsageParser.js';
 import { openAiResponsesTransformer } from '../../transformers/openai/responses/index.js';
 import {
+  extractResponsesTerminalResponseId,
+  isResponsesPreviousResponseNotFoundError,
+  shouldInferResponsesPreviousResponseId,
+  stripResponsesPreviousResponseId,
+  withResponsesPreviousResponseId,
+} from '../../transformers/openai/responses/continuation.js';
+import {
   buildUpstreamEndpointRequest,
   resolveUpstreamEndpointCandidates,
 } from '../../routes/proxy/upstreamEndpoint.js';
@@ -39,11 +46,17 @@ import { isCodexResponsesSurface } from '../cliProfiles/codexProfile.js';
 import { readRuntimeResponseText } from '../executors/types.js';
 import { runCodexHttpSessionTask } from '../runtime/codexHttpSessionQueue.js';
 import {
+  clearCodexSessionResponseId,
+  getCodexSessionResponseId,
+  setCodexSessionResponseId,
+} from '../runtime/codexSessionResponseStore.js';
+import {
   summarizeConversationFileInputsInOpenAiBody,
   summarizeConversationFileInputsInResponsesBody,
 } from '../capabilities/conversationFileCapabilities.js';
 import { detectDownstreamClientContext } from '../../routes/proxy/downstreamClientContext.js';
 import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
+import { shouldAbortSameSiteEndpointFallback } from '../../services/proxyRetryPolicy.js';
 import {
   acquireSurfaceChannelLease,
   bindSurfaceStickyChannel,
@@ -87,6 +100,12 @@ function isResponsesWebsocketTransportRequest(headers: Record<string, unknown>):
   return Object.entries(headers)
     .some(([rawKey, rawValue]) => rawKey.trim().toLowerCase() === 'x-metapi-responses-websocket-transport'
       && String(rawValue).trim() === '1');
+}
+
+function rememberCodexSessionResponseId(sessionId: string, payload: unknown): void {
+  const responseId = extractResponsesTerminalResponseId(payload);
+  if (!responseId) return;
+  setCodexSessionResponseId(sessionId, responseId);
 }
 
 function normalizeIncludeList(value: unknown): string[] {
@@ -306,6 +325,9 @@ export async function handleOpenAiResponsesSurfaceRequest(
       const modelName = selected.actualModel || requestedModel;
       const oauth = getOauthInfoFromAccount(selected.account);
       const isCodexSite = String(selected.site.platform || '').trim().toLowerCase() === 'codex';
+      const codexSessionId = isCodexSite
+        ? getCodexSessionHeaderValue(request.headers as Record<string, string>)
+        : '';
       const owner = getProxyResourceOwner(request);
       let normalizedResponsesBody: Record<string, unknown> = {
         ...requestEnvelope.parsed.normalizedBody,
@@ -387,6 +409,20 @@ export async function handleOpenAiResponsesSurfaceRequest(
       );
       const buildEndpointRequest = (endpoint: 'chat' | 'messages' | 'responses') => {
         const upstreamStream = isStream || (isCodexSite && endpoint === 'responses');
+        const responsesOriginalBody = (
+          endpoint === 'responses'
+          && isCodexSite
+          && codexSessionId
+          && shouldInferResponsesPreviousResponseId(
+            normalizedResponsesBody,
+            getCodexSessionResponseId(codexSessionId),
+          )
+        )
+          ? withResponsesPreviousResponseId(
+            normalizedResponsesBody,
+            getCodexSessionResponseId(codexSessionId)!,
+          )
+          : normalizedResponsesBody;
         const endpointRequest = buildUpstreamEndpointRequest({
           endpoint,
           modelName,
@@ -398,7 +434,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
           siteUrl: selected.site.url,
           openaiBody: openAiBody,
           downstreamFormat: 'responses',
-          responsesOriginalBody: normalizedResponsesBody,
+          responsesOriginalBody,
           downstreamHeaders: request.headers as Record<string, unknown>,
           providerHeaders: buildProviderHeaders(),
         });
@@ -455,6 +491,35 @@ export async function handleOpenAiResponsesSurfaceRequest(
             return recovered;
           }
         }
+        if (
+          ctx.request.endpoint === 'responses'
+          && isResponsesPreviousResponseNotFoundError({
+            rawErrText: ctx.rawErrText,
+          })
+        ) {
+          if (codexSessionId) {
+            clearCodexSessionResponseId(codexSessionId);
+          }
+          const previousResponseRecovery = stripResponsesPreviousResponseId(ctx.request.body);
+          if (previousResponseRecovery.removed) {
+            const recoveredRequest = {
+              ...ctx.request,
+              body: previousResponseRecovery.body,
+            };
+            const recoveredResponse = await dispatchRequest(recoveredRequest, ctx.targetUrl);
+            if (recoveredResponse.ok) {
+              return {
+                upstream: recoveredResponse,
+                upstreamPath: recoveredRequest.path,
+                request: recoveredRequest,
+                targetUrl: ctx.targetUrl,
+              };
+            }
+            ctx.request = recoveredRequest;
+            ctx.response = recoveredResponse;
+            ctx.rawErrText = await readRuntimeResponseText(recoveredResponse).catch(() => 'unknown error');
+          }
+        }
         return endpointStrategy.tryRecover(ctx);
       };
 
@@ -505,6 +570,10 @@ export async function handleOpenAiResponsesSurfaceRequest(
           buildRequest: (endpoint) => buildEndpointRequest(endpoint),
           dispatchRequest,
           tryRecover,
+          shouldAbortRemainingEndpoints: (ctx) => shouldAbortSameSiteEndpointFallback(
+            ctx.response.status,
+            ctx.rawErrText || ctx.errText,
+          ),
           onAttemptFailure: async (ctx) => {
             const memoryWrite = recordUpstreamEndpointFailure({
               ...endpointRuntimeContext,
@@ -662,6 +731,9 @@ export async function handleOpenAiResponsesSurfaceRequest(
             onParsedPayload: (payload) => {
               if (payload && typeof payload === 'object') {
                 parsedUsage = mergeProxyUsage(parsedUsage, parseProxyUsage(payload));
+                if (codexSessionId) {
+                  rememberCodexSessionResponseId(codexSessionId, payload);
+                }
               }
             },
             writeLines,
@@ -723,6 +795,9 @@ export async function handleOpenAiResponsesSurfaceRequest(
             }
             if (String(selected.site.platform || '').trim().toLowerCase() === 'gemini-cli') {
               upstreamData = unwrapGeminiCliPayload(upstreamData);
+            }
+            if (codexSessionId) {
+              rememberCodexSessionResponseId(codexSessionId, upstreamData);
             }
 
             parsedUsage = parseProxyUsage(upstreamData);
@@ -821,6 +896,9 @@ export async function handleOpenAiResponsesSurfaceRequest(
                   `event: ${terminalEventType}\ndata: ${JSON.stringify({ type: terminalEventType, response: collectedPayload })}\n\n`,
                   'data: [DONE]\n\n',
                 ]);
+                if (codexSessionId) {
+                  rememberCodexSessionResponseId(codexSessionId, collectedPayload);
+                }
                 reply.raw.end();
                 const latency = Date.now() - startTime;
                 await finalizeStreamSuccess(
@@ -971,6 +1049,9 @@ export async function handleOpenAiResponsesSurfaceRequest(
         }
         if (String(selected.site.platform || '').trim().toLowerCase() === 'gemini-cli') {
           upstreamData = unwrapGeminiCliPayload(upstreamData);
+        }
+        if (codexSessionId) {
+          rememberCodexSessionResponseId(codexSessionId, upstreamData);
         }
         const latency = Date.now() - startTime;
         const parsedUsage = parseProxyUsage(upstreamData);
